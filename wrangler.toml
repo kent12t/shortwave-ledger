@@ -1,4 +1,4 @@
 name = "shortwave-ledger"
-pages_build_output_dir = ".worker-next"
+pages_build_output_dir = ".open-next"
 compatibility_date = "2024-05-02"
 compatibility_flags = ["nodejs_compat"]

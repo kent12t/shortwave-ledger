@@ -8,8 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "pages:build": "opennextjs-cloudflare build",
-    "pages:preview": "wrangler pages dev .worker-next --compatibility-flag=nodejs_compat",
-    "pages:deploy": "bun run pages:build && wrangler pages deploy .worker-next"
+    "pages:preview": "wrangler pages dev .open-next --compatibility-flag=nodejs_compat",
+    "pages:deploy": "bun run pages:build && wrangler pages deploy .open-next"
   },
   "dependencies": {
     "@opennextjs/cloudflare": "^1.17.1",

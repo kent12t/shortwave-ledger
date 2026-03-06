@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { collectHeadlines, totalFeedCount } from "@/lib/news";
 
-export const runtime = "edge";
 export const revalidate = 300; // Cache for 5 minutes at the edge
 
 export async function GET() {
