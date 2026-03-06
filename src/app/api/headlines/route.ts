@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { collectHeadlines, totalFeedCount } from "@/lib/news";
 
-export const revalidate = 0;
+export const runtime = "edge";
+export const revalidate = 300; // Cache for 5 minutes at the edge
 
 export async function GET() {
   try {
@@ -15,7 +16,12 @@ export async function GET() {
           feedHealth: `${feedSuccess}/${totalFeedCount}`,
           message: "No headlines available right now.",
         },
-        { status: 503 },
+        { 
+          status: 503,
+          headers: {
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+          }
+        },
       );
     }
 
@@ -28,7 +34,7 @@ export async function GET() {
       {
         status: 200,
         headers: {
-          "Cache-Control": "no-store",
+          "Cache-Control": "public, s-maxage=300, stale-while-revalidate=59",
         },
       },
     );

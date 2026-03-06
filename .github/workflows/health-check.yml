@@ -1,0 +1,15 @@
+name: Hourly Health Check
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          # Replace with your actual domain after deployment (e.g., shortwave-ledger.pages.dev)
+          DOMAIN="your-app-domain.pages.dev"
+          curl -f "https://$DOMAIN/api/health" || (echo "Health check failed!" && exit 1)

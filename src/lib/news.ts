@@ -279,6 +279,27 @@ function dedupeEntries(entries: ParsedEntry[]): ParsedEntry[] {
   return [...combined.values()];
 }
 
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  retries = 2,
+): Promise<Response> {
+  try {
+    const response = await fetch(url, options);
+    if (!response.ok && retries > 0) {
+      throw new Error(`Retrying ${url}...`);
+    }
+    return response;
+  } catch (err) {
+    if (retries > 0) {
+      // Exponential backoff: 500ms, then 1000ms
+      await new Promise((res) => setTimeout(res, (3 - retries) * 500));
+      return fetchWithRetry(url, options, retries - 1);
+    }
+    throw err;
+  }
+}
+
 export async function collectHeadlines(): Promise<{
   headlines: Headline[];
   feedSuccess: number;
@@ -287,13 +308,17 @@ export async function collectHeadlines(): Promise<{
 
   const feedResults = await Promise.allSettled(
     FEEDS.map(async (feed) => {
-      const response = await fetch(feed.url, {
-        cache: "no-store",
-        headers: {
-          "User-Agent": "ShortwaveLedger/1.0",
+      const response = await fetchWithRetry(
+        feed.url,
+        {
+          cache: "no-store",
+          headers: {
+            "User-Agent": "ShortwaveLedger/1.0",
+          },
+          signal: AbortSignal.timeout(8000),
         },
-        signal: AbortSignal.timeout(8000),
-      });
+        1, // 1 retry
+      );
 
       if (!response.ok) {
         throw new Error(`Feed ${feed.name} failed: ${response.status}`);
