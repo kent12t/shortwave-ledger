@@ -7,9 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "pages:build": "opennextjs-cloudflare build",
-    "pages:preview": "wrangler pages dev .open-next --compatibility-flag=nodejs_compat",
-    "pages:deploy": "bun run pages:build && wrangler pages deploy .open-next"
+    "pages:build": "opennextjs-cloudflare build && node -e \"require('fs').renameSync('.open-next/worker.js', '.open-next/assets/_worker.js')\"",
+    "pages:preview": "wrangler pages dev .open-next/assets --compatibility-flag=nodejs_compat",
+    "pages:deploy": "bun run pages:build && wrangler pages deploy .open-next/assets"
   },
   "dependencies": {
     "@opennextjs/cloudflare": "^1.17.1",
