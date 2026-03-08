@@ -11,5 +11,5 @@ jobs:
       - name: Ping health endpoint
         run: |
           # Replace with your actual domain after deployment (e.g., shortwave-ledger.pages.dev)
-          DOMAIN="https://news.pixelsmith.io/"
+          DOMAIN="news.pixelsmith.io"
           curl -f "https://$DOMAIN/api/health" || (echo "Health check failed!" && exit 1)
