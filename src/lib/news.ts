@@ -97,8 +97,39 @@ function toArray<T>(value: T | T[] | undefined): T[] {
   return Array.isArray(value) ? value : [value];
 }
 
+const HTML_ENTITIES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#039;": "'",
+  "&#39;": "'",
+  "&apos;": "'",
+  "&nbsp;": " ",
+  "&mdash;": "\u2014",
+  "&ndash;": "\u2013",
+  "&lsquo;": "\u2018",
+  "&rsquo;": "\u2019",
+  "&ldquo;": "\u201C",
+  "&rdquo;": "\u201D",
+};
+
+function decodeEntities(value: string): string {
+  return value
+    .replace(/&[a-zA-Z]+;|&#\d+;|&#x[0-9a-fA-F]+;/g, (match) => {
+      if (match in HTML_ENTITIES) return HTML_ENTITIES[match]!;
+      if (match.startsWith("&#x"))
+        return String.fromCodePoint(parseInt(match.slice(3, -1), 16));
+      if (match.startsWith("&#"))
+        return String.fromCodePoint(parseInt(match.slice(2, -1), 10));
+      return match;
+    });
+}
+
 function stripTags(value: string): string {
-  return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return decodeEntities(
+    value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+  );
 }
 
 function canonicalUrl(value: string): string {
