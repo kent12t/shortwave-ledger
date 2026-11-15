@@ -1,53 +1,57 @@
 import { NextResponse } from "next/server";
-import { collectHeadlines, totalFeedCount } from "@/lib/news";
+import { collectHeadlines, totalFeedCount, type FeedStatus, type Headline } from "@/lib/news";
 
 export const revalidate = 300; // Cache for 5 minutes at the edge
 
+export type HeadlinesResponse = {
+  headlines: Headline[];
+  feeds: FeedStatus[];
+  feedHealth: string;
+  generatedAt: string;
+  message?: string;
+};
+
+const NO_STORE = { "Cache-Control": "no-store" };
+
 export async function GET() {
+  const generatedAt = new Date().toISOString();
+
   try {
-    const { headlines, feedSuccess } = await collectHeadlines();
+    const { headlines, feeds } = await collectHeadlines();
+    const feedHealth = `${feeds.filter((feed) => feed.ok).length}/${totalFeedCount}`;
 
     if (headlines.length === 0) {
-      return NextResponse.json(
+      return NextResponse.json<HeadlinesResponse>(
         {
           headlines: [],
-          generatedAt: new Date().toISOString(),
-          feedHealth: `${feedSuccess}/${totalFeedCount}`,
-          message: "No headlines available right now.",
+          feeds,
+          feedHealth,
+          generatedAt,
+          message: "Every station is silent right now. Try again in a minute.",
         },
-        { 
-          status: 503,
-          headers: {
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-          }
-        },
+        { status: 503, headers: NO_STORE },
       );
     }
 
-    return NextResponse.json(
+    return NextResponse.json<HeadlinesResponse>(
+      { headlines, feeds, feedHealth, generatedAt },
       {
-        headlines,
-        generatedAt: new Date().toISOString(),
-        feedHealth: `${feedSuccess}/${totalFeedCount}`,
-      },
-      {
-        status: 200,
         headers: {
-          "Cache-Control": "public, s-maxage=300, stale-while-revalidate=59",
+          "Cache-Control": "public, s-maxage=300, stale-while-revalidate=600",
         },
       },
     );
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-
-    return NextResponse.json(
+    console.error("headlines: collection failed", error);
+    return NextResponse.json<HeadlinesResponse>(
       {
         headlines: [],
-        generatedAt: new Date().toISOString(),
+        feeds: [],
         feedHealth: `0/${totalFeedCount}`,
-        message,
+        generatedAt,
+        message: "The receiver hit a fault while tuning. Try again shortly.",
       },
-      { status: 500 },
+      { status: 500, headers: NO_STORE },
     );
   }
 }

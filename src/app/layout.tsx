@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Cormorant_Garamond, Space_Mono } from "next/font/google";
 import "./globals.css";
 
@@ -17,7 +17,24 @@ const spaceMono = Space_Mono({
 export const metadata: Metadata = {
   title: "Shortwave Ledger",
   description:
-    "A retro, mobile-first news front page tuned by cross-source consensus.",
+    "Tune a radio dial through today's news, ranked by how many independent newsrooms agree it matters.",
+  openGraph: {
+    title: "Shortwave Ledger",
+    description: "A consensus-ranked news dial with a tactile, radio-inspired interface.",
+    url: "https://news.pixelsmith.io",
+    siteName: "Shortwave Ledger",
+    type: "website",
+  },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f6f1e6" },
+    { media: "(prefers-color-scheme: dark)", color: "#17120d" },
+  ],
 };
 
 export default function RootLayout({
@@ -26,13 +43,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <head>
-        <meta
-          name="viewport"
-          content="width=device-width, initial-scale=1.0, viewport-fit=cover"
-        />
-      </head>
+    <html lang="en">
       <body
         className={`${cormorant.variable} ${spaceMono.variable} antialiased`}
       >

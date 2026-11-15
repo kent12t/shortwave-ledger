@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "pages:build": "opennextjs-cloudflare build && node scripts/post-build.js",
+    "pages:build": "opennextjs-cloudflare build && node scripts/post-build.mjs",
     "pages:preview": "wrangler pages dev .open-next/assets --compatibility-flag=nodejs_compat",
     "pages:deploy": "npm run pages:build && wrangler pages deploy .open-next/assets",
     "cf:build": "opennextjs-cloudflare build",

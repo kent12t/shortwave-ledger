@@ -1,541 +1,489 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import type { Headline } from "@/lib/news";
+import type { HeadlinesResponse } from "@/app/api/headlines/route";
+import { HistoryDrawer } from "@/components/HistoryDrawer";
+import { SignalField } from "@/components/SignalField";
+import { Tuner } from "@/components/Tuner";
+import { ReceiverAudio } from "@/lib/audio";
+import {
+  addSeen,
+  clearHistory,
+  readHistory,
+  readPreference,
+  writePreference,
+  type SeenHeadline,
+} from "@/lib/history";
+import { RadioEngine, layoutStations } from "@/lib/radio";
 
-type SeenHeadline = {
-  id: string;
-  title: string;
-  source: string;
-  url: string;
-  seenAt: string;
-};
+/** Stay locked on a story this long before it is written to the log. */
+const DWELL_MS = 1500;
+/** Refetch when the tab returns and the data is older than this. */
+const STALE_MS = 10 * 60 * 1000;
 
-const HISTORY_KEY = "shortwave-ledger-history-v1";
+type Status = "loading" | "ready" | "error";
 
-// Number of horizontal wave lines drawn across the background
-const LINE_COUNT = 22;
-
-// Per-line stable random seeds so each line has its own character
-const LINE_SEEDS = Array.from({ length: LINE_COUNT }, (_, i) => {
-  // Deterministic pseudo-random from index so SSR and client agree
-  const s = Math.sin(i * 127.1 + 311.7) * 43758.5453;
-  return s - Math.floor(s);
-});
-
-/**
- * Build an SVG path string for a single wave line.
- *
- * The wave is a superposition of 4 sinusoids at harmonic frequencies
- * (fundamental + 2nd + 3rd + 4th harmonic), each with independent phase
- * speeds driven by `time`. This is the Fourier-series approach and produces
- * smooth, naturally organic motion without any sharp artefacts.
- *
- * `tune`  [0..100]  – scales both amplitude and frequency
- * `seed`  [0..1]    – per-line random offset so lines differ
- * `baseY`           – vertical centre of the line in SVG units
- */
-function buildWavePath(
-  time: number,
-  tune: number,
-  seed: number,
-  baseY: number,
-): string {
-  const t = tune / 100; // normalised 0→1
-
-  // Amplitude: at tune=0 the lines are almost flat (0.5 px); at tune=100
-  // they swing ±10 px. Kept deliberately lower for readability.
-  const amp = 0.5 + 9.5 * Math.pow(t, 1.6);
-
-  // Frequency: scaled to 0.6x of the previous tight look.
-  const freqBase = 0.144 + 0.336 * Math.pow(t, 1.2);
-
-  // Scroll speed: baseline increased, and accelerates faster at high tune.
-  const speed = 1.5 + 10.5 * Math.pow(t, 2.2);
-
-  // Per-line offsets so no two lines look identical
-  const phaseOff = seed * Math.PI * 2;
-  const ampMod = 0.72 + seed * 0.56;
-
-  // Step size: fine enough to show noise but coarse enough to look "electronic"
-  const step = 2.5;
-
-  let d = `M -10 ${baseY.toFixed(1)}`;
-
-  for (let x = 0; x <= 1220; x += step) {
-    const kx = x * freqBase + phaseOff;
-    const wt = time * speed;
-
-    // Multi-octave composition.
-    const sig1 = Math.sin(kx + wt);
-    const sig2 = Math.sin(kx * 2.13 + wt * 1.71 + 0.5) * 0.45;
-    const sig3 = Math.sin(kx * 4.97 - wt * 2.33 + 1.2) * 0.25;
-
-    // High-frequency "crackle" using a combination of fast sines.
-    // This creates a textured, non-smooth signal.
-    const noise = Math.sin(x * 1.5 + time * 60) * 
-                  Math.sin(x * 0.8 - time * 45) * 
-                  Math.sin(x * 3.2 + time * 90);
-    const crackle = noise * (0.2 + t * 1.8);
-
-    // Occasional "signal drop" or "spike" jitter
-    const jitterFactor = Math.sin(x * 0.05 + time * 12 + seed);
-    const jitter = jitterFactor > 0.985 ? (Math.random() - 0.5) * 6 * t : 0;
-
-    const dy = (sig1 + sig2 + sig3 + crackle + jitter) * amp * ampMod;
-    d += ` L ${x.toFixed(0)} ${(baseY + dy).toFixed(2)}`;
-  }
-
-  return d;
-}
-
-function clampTune(value: number): number {
-  return Math.max(0, Math.min(100, value));
-}
-
-function normalizeAngleDelta(delta: number): number {
-  if (delta > 180) return delta - 360;
-  if (delta < -180) return delta + 360;
-  return delta;
-}
-
-function vibrate(ms: number) {
-  if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-    navigator.vibrate(ms);
-  }
-}
-
-function readHistory(): SeenHeadline[] {
-  if (typeof window === "undefined") return [];
+function vibrate(pattern: number | number[]) {
   try {
-    const raw = window.localStorage.getItem(HISTORY_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as SeenHeadline[];
-    return Array.isArray(parsed) ? parsed : [];
+    // Browsers refuse (and warn) until the user has interacted with the page.
+    const activation = (navigator as Navigator & { userActivation?: { hasBeenActive: boolean } })
+      .userActivation;
+    if (activation && !activation.hasBeenActive) return;
+    navigator.vibrate?.(pattern);
   } catch {
-    return [];
+    // Unsupported (iOS Safari) — haptics are a bonus.
   }
 }
 
-function writeHistory(items: SeenHeadline[]) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, 120)));
+function relativeTime(iso: string, now: number) {
+  const minutes = Math.round((now - Date.parse(iso)) / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
 }
 
-function addSeen(headline: Headline) {
-  const existing = readHistory();
-  const deduped = existing.filter((item) => item.id !== headline.id);
-  writeHistory([
-    {
-      id: headline.id,
-      title: headline.title,
-      source: headline.source,
-      url: headline.url,
-      seenAt: new Date().toISOString(),
-    },
-    ...deduped,
-  ]);
-}
-
-function formatStamp(value: string) {
-  return new Date(value).toLocaleString([], {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+function pad(n: number) {
+  return String(n).padStart(2, "0");
 }
 
 export default function Home() {
-  const [headlines, setHeadlines] = useState<Headline[]>([]);
-  const [index, setIndex] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [message, setMessage] = useState("");
-  const [feedHealth, setFeedHealth] = useState("");
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [engine] = useState(() => new RadioEngine());
+  const [audio] = useState(() => new ReceiverAudio());
+
+  const [data, setData] = useState<HeadlinesResponse | null>(null);
+  const [status, setStatus] = useState<Status>("loading");
+  const [nearest, setNearest] = useState(-1);
+  const [locked, setLocked] = useState(false);
   const [history, setHistory] = useState<SeenHeadline[]>([]);
-  const [tune, setTune] = useState(30);
-  const [dragOrigin, setDragOrigin] = useState<{
-    pointerId: number;
-    centerX: number;
-    centerY: number;
-    lastAngle: number;
-    tune: number;
-  } | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [soundOn, setSoundOn] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
 
-  // ── animated wave paths ────────────────────────────────────────────────────
-  // We drive animation via rAF without causing React re-renders on every frame.
-  // Instead we write directly to SVG <path> `d` attributes via refs.
-  const svgRef = useRef<SVGSVGElement>(null);
-  const tuneRef = useRef(tune);
-  const rafRef = useRef<number>(0);
+  const rootRef = useRef<HTMLElement>(null);
+  const currentIdRef = useRef<string | null>(null);
+  const loadedAtRef = useRef(0);
+  const closeHistory = useCallback(() => setHistoryOpen(false), []);
 
-  // Keep tuneRef in sync with state so the rAF loop always reads the latest value
+  const headlines = useMemo(() => data?.headlines ?? [], [data]);
+  const stations = useMemo(() => layoutStations(headlines.length), [headlines.length]);
+  const current = headlines[nearest] ?? null;
+  const seenIds = useMemo(() => new Set(history.map((item) => item.id)), [history]);
+
+  // ── radio engine wiring ──────────────────────────────────────────────────
   useEffect(() => {
-    tuneRef.current = tune;
-  }, [tune]);
+    const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const syncMotion = () => engine.setReducedMotion(motion.matches);
+    syncMotion();
+    motion.addEventListener("change", syncMotion);
 
-  useEffect(() => {
-    let startTime: number | null = null;
+    const root = rootRef.current;
+    const offs = [
+      engine.on("frame", ({ tune, clarity, speed }) => {
+        if (root) {
+          root.style.setProperty("--tune", tune.toFixed(5));
+          root.style.setProperty("--clarity", clarity.toFixed(3));
+        }
+        audio.update(clarity, speed);
+      }),
+      engine.on("nearest", setNearest),
+      engine.on("lock", () => {
+        setLocked(true);
+        audio.lock();
+        vibrate([8, 40, 14]);
+      }),
+      engine.on("unlock", () => setLocked(false)),
+      engine.on("detent", () => {
+        audio.detent();
+        vibrate(6);
+      }),
+    ];
+    engine.start();
 
-    function frame(ts: number) {
-      if (startTime === null) startTime = ts;
-      const time = (ts - startTime) / 1000; // seconds
-
-      const svg = svgRef.current;
-      if (svg) {
-        const paths = svg.querySelectorAll<SVGPathElement>("path[data-wave]");
-        paths.forEach((path, i) => {
-          const seed = LINE_SEEDS[i] ?? 0;
-          const baseY = 20 + i * 40;
-          path.setAttribute(
-            "d",
-            buildWavePath(time, tuneRef.current, seed, baseY),
-          );
-        });
-      }
-
-      rafRef.current = requestAnimationFrame(frame);
-    }
-
-    rafRef.current = requestAnimationFrame(frame);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, []);
-
-  // ── data fetching ──────────────────────────────────────────────────────────
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const response = await fetch("/api/headlines", { cache: "no-store" });
-        const data = (await response.json()) as {
-          headlines: Headline[];
-          message?: string;
-          feedHealth?: string;
-        };
-        setHeadlines(data.headlines ?? []);
-        setFeedHealth(data.feedHealth ?? "");
-        setMessage(data.message ?? "");
-      } catch {
-        setMessage("Unable to tune into feeds right now.");
-      } finally {
-        setLoading(false);
-      }
+    return () => {
+      offs.forEach((off) => off());
+      motion.removeEventListener("change", syncMotion);
+      engine.stop();
     };
+  }, [engine, audio]);
 
-    load().catch(() => {
-      setLoading(false);
-      setMessage("Unable to tune into feeds right now.");
-    });
-    setHistory(readHistory());
-  }, []);
+  // ── data ─────────────────────────────────────────────────────────────────
+  const load = useCallback(async () => {
+    try {
+      const response = await fetch("/api/headlines", { cache: "no-store" });
+      const payload = (await response.json()) as HeadlinesResponse;
+      const next = payload.headlines ?? [];
+      const positions = layoutStations(next.length);
+      const keepIndex = next.findIndex((h) => h.id === currentIdRef.current);
 
-  const current = headlines[index] ?? null;
+      engine.setStations(positions);
+      if (keepIndex >= 0) {
+        // Refresh: stay on the story the reader was on.
+        engine.setTune(positions[keepIndex]!);
+      } else if (positions.length > 0) {
+        // First load: sweep in from across the band and lock the top story.
+        engine.glideTo(positions[0]!, 3.2);
+      }
+
+      loadedAtRef.current = Date.now();
+      setData(payload);
+      setNow(Date.now());
+      setStatus(next.length > 0 ? "ready" : "error");
+    } catch {
+      setData(null);
+      setStatus("error");
+    }
+  }, [engine]);
 
   useEffect(() => {
-    if (!current) return;
-    addSeen(current);
-    setHistory(readHistory());
+    // Drift the needle while we wait, as if scanning for a signal.
+    engine.setTune(0.55);
+    engine.glideTo(0.38, 0.6);
+    const initial = window.setTimeout(() => void load(), 0);
+
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      setNow(Date.now());
+      if (loadedAtRef.current && Date.now() - loadedAtRef.current > STALE_MS) void load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    const clock = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => {
+      window.clearTimeout(initial);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.clearInterval(clock);
+    };
+  }, [engine, load]);
+
+  const retry = () => {
+    setStatus("loading");
+    engine.glideTo(Math.random(), 0.8);
+    void load();
+  };
+
+  // ── persisted client state ───────────────────────────────────────────────
+  useEffect(() => {
+    // Deferred so the server and first client render agree.
+    const id = window.setTimeout(() => {
+      setHistory(readHistory());
+      if (readPreference("sound") === "on") setSoundOn(true);
+    }, 0);
+    return () => window.clearTimeout(id);
+  }, []);
+
+  useEffect(() => {
+    currentIdRef.current = current?.id ?? null;
   }, [current]);
 
-  const groupedHistory = useMemo(() => {
-    const groups = new Map<string, SeenHeadline[]>();
-    history.forEach((item) => {
-      const day = new Date(item.seenAt).toLocaleDateString([], {
-        weekday: "long",
-        month: "short",
-        day: "numeric",
-        year: "numeric",
-      });
-      const existing = groups.get(day) ?? [];
-      groups.set(day, [...existing, item]);
-    });
-    return [...groups.entries()];
-  }, [history]);
+  // Only log a story once the reader has actually stopped on it.
+  useEffect(() => {
+    if (!locked || !current) return;
+    const id = window.setTimeout(() => setHistory(addSeen(current)), DWELL_MS);
+    return () => window.clearTimeout(id);
+  }, [locked, current]);
 
-  const showNext = () => {
-    if (headlines.length < 2) return;
-    vibrate(12);
-    setIndex((previous) => (previous + 1) % headlines.length);
+  // Audio can only start from a user gesture, so a remembered "on"
+  // preference arms it for the first interaction.
+  useEffect(() => {
+    if (!soundOn || audio.enabled) return;
+    const arm = () => void audio.enable();
+    window.addEventListener("pointerdown", arm, { once: true });
+    window.addEventListener("keydown", arm, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", arm);
+      window.removeEventListener("keydown", arm);
+    };
+  }, [soundOn, audio]);
+
+  const toggleSound = () => {
+    const next = !soundOn;
+    setSoundOn(next);
+    writePreference("sound", next ? "on" : "off");
+    if (next) void audio.enable();
+    else void audio.disable();
+    vibrate(10);
   };
 
-  const toggleHistory = () => {
-    vibrate(18);
-    setHistory(readHistory());
-    setHistoryOpen((previous) => !previous);
+  // ── keyboard: ← → seek anywhere on the page ─────────────────────────────
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (historyOpen || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable], [role=slider]")) return;
+      if (event.key === "ArrowRight" || event.key === "j") engine.seek(1);
+      else if (event.key === "ArrowLeft" || event.key === "k") engine.seek(-1);
+      else return;
+      event.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [engine, historyOpen]);
+
+  // ── swipe the story card to scrub the dial ───────────────────────────────
+  const scrub = useRef<{
+    id: number;
+    x: number;
+    y: number;
+    tune: number;
+    from: number;
+    active: boolean;
+  } | null>(null);
+  const suppressClick = useRef(false);
+
+  const onCardDown = (event: ReactPointerEvent<HTMLElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    scrub.current = {
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      tune: engine.tune,
+      from: nearest,
+      active: false,
+    };
   };
 
-  // ── CSS custom properties driven by tune ──────────────────────────────────
-  const tuneRatio = tune / 100;
-  const signalVars = {
-    "--signal-power": `${(0.18 + tuneRatio * 0.54).toFixed(3)}`,
-    "--signal-jagged": `${tuneRatio.toFixed(3)}`,
-  } as CSSProperties;
-
-  // Per-line visual properties (static, depend only on line index)
-  const lineProps = useMemo(
-    () =>
-      Array.from({ length: LINE_COUNT }, (_, i) => ({
-        id: i,
-        strokeWidth: 0.7 + (i % 3) * 0.18,
-        // Opacity is also scaled by tune at render time via CSS var
-        baseOpacity: 0.06 + (i % 5) * 0.022,
-      })),
-    [],
-  );
-
-  // ── knob interaction ───────────────────────────────────────────────────────
-  const knobAngle = -132 + tuneRatio * 264;
-
-  const adjustTune = (delta: number) => {
-    setTune((previous) => clampTune(previous + delta));
+  const onCardMove = (event: ReactPointerEvent<HTMLElement>) => {
+    const s = scrub.current;
+    if (!s || s.id !== event.pointerId || stations.length < 2) return;
+    const dx = event.clientX - s.x;
+    const dy = event.clientY - s.y;
+    if (!s.active) {
+      if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) {
+        scrub.current = null; // vertical scroll — let it go
+        return;
+      }
+      if (Math.abs(dx) < 10) return;
+      s.active = true;
+      event.currentTarget.setPointerCapture(event.pointerId);
+      engine.beginDrag();
+    }
+    const spacing = (stations[stations.length - 1]! - stations[0]!) / (stations.length - 1);
+    const width = event.currentTarget.getBoundingClientRect().width;
+    engine.setTune(s.tune - (dx / width) * spacing * 1.8);
   };
 
-  const onKnobPointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    event.currentTarget.setPointerCapture(event.pointerId);
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const centerX = bounds.left + bounds.width / 2;
-    const centerY = bounds.top + bounds.height / 2;
-    setDragOrigin({
-      pointerId: event.pointerId,
-      centerX,
-      centerY,
-      lastAngle: Math.atan2(event.clientY - centerY, event.clientX - centerX),
-      tune,
-    });
+  const onCardUp = (event: ReactPointerEvent<HTMLElement>) => {
+    const s = scrub.current;
+    scrub.current = null;
+    if (!s || s.id !== event.pointerId || !s.active) return;
+    engine.endDrag();
+    suppressClick.current = true;
+    window.setTimeout(() => (suppressClick.current = false), 50);
+    // A short flick that didn't cross halfway still changes station.
+    const dx = event.clientX - s.x;
+    if (Math.abs(dx) > 36 && nearest === s.from) engine.seek(dx < 0 ? 1 : -1);
   };
 
-  const onKnobPointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (!dragOrigin || dragOrigin.pointerId !== event.pointerId) return;
-
-    const dist = Math.hypot(
-      event.clientX - dragOrigin.centerX,
-      event.clientY - dragOrigin.centerY,
-    );
-    if (dist < 8) return;
-
-    const angle = Math.atan2(
-      event.clientY - dragOrigin.centerY,
-      event.clientX - dragOrigin.centerX,
-    );
-    const rawDelta = ((angle - dragOrigin.lastAngle) * 180) / Math.PI;
-    const angularDelta = normalizeAngleDelta(rawDelta);
-    if (Math.abs(angularDelta) < 0.01) return;
-
-    const nextTune = clampTune(dragOrigin.tune + angularDelta * 0.52);
-    setTune(nextTune);
-    setDragOrigin({ ...dragOrigin, lastAngle: angle, tune: nextTune });
-  };
-
-  const onKnobPointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (dragOrigin && dragOrigin.pointerId === event.pointerId) {
-      setDragOrigin(null);
-      vibrate(10);
+  const onCardClickCapture = (event: ReactMouseEvent) => {
+    if (suppressClick.current) {
+      event.preventDefault();
+      event.stopPropagation();
     }
   };
 
-  // ── render ─────────────────────────────────────────────────────────────────
-  return (
-    <main className="paper-bg min-h-dvh px-3 py-4 sm:py-6" style={signalVars}>
-      {/* Always-animating wave background */}
-      <div className="signal-overlay" aria-hidden="true">
-        <svg
-          ref={svgRef}
-          viewBox={`0 0 1200 ${20 + LINE_COUNT * 40}`}
-          preserveAspectRatio="none"
-        >
-          {lineProps.map((line) => (
-            <path
-              key={line.id}
-              data-wave
-              className="signal-path"
-              d=""
-              strokeWidth={line.strokeWidth}
-              style={{
-                opacity: `calc(${line.baseOpacity} + var(--signal-jagged, 0) * ${(line.baseOpacity * 1.4).toFixed(3)})`,
-              }}
-            />
-          ))}
-        </svg>
-      </div>
+  // ── render ───────────────────────────────────────────────────────────────
+  const feedsDown = data?.feeds.filter((feed) => !feed.ok).map((feed) => feed.name) ?? [];
+  const channelLabel =
+    status === "error" ? "No Signal" : nearest <= 0 ? "Main Signal" : `Channel ${pad(nearest + 1)}`;
+  const subtitle =
+    status === "error"
+      ? "Every newsroom feed is quiet for the moment"
+      : status === "loading"
+        ? "Tuning across the world service band"
+        : nearest <= 0
+          ? "The story most newsrooms agree on right now"
+          : `Ranked ${nearest + 1} of ${headlines.length} by cross-source consensus`;
 
-      <div className="relative z-10 mx-auto flex min-h-[calc(100dvh-2rem)] w-full max-w-md flex-col justify-center gap-4 sm:min-h-[calc(100dvh-3rem)]">
-        <section className="flex w-full flex-col gap-4 rounded-[1.5rem] border border-[var(--line)] bg-[var(--paper)] p-4 shadow-[0_14px_30px_rgba(53,40,23,0.14)] sm:p-6">
-          <header className="relative border-b border-dashed border-[var(--line)] pb-3">
-            <button
-              onClick={toggleHistory}
-              className="history-button"
-              aria-label="Open viewed headline history"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 8v4l2.8 1.6M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4" />
-              </svg>
-            </button>
-            <p className="font-mono text-[0.68rem] uppercase tracking-[0.24em] text-[var(--ink-soft)]">
-              Shortwave Ledger
-            </p>
-            <h1 className="mt-1 text-4xl leading-none font-semibold text-[var(--ink)]">
-              Main Signal
-            </h1>
-            <p className="mt-1 font-mono text-xs text-[var(--ink-soft)]">
-              Consensus-ranked headline of the day
-            </p>
+  return (
+    <main ref={rootRef} className="receiver" data-locked={locked || undefined}>
+      <SignalField engine={engine} variant="field" className="signal-field" />
+
+      <div className="receiver-stack">
+        <section className="ledger-card" aria-labelledby="channel-title">
+          <header className="ledger-head">
+            <div>
+              <p className="eyebrow">Shortwave Ledger</p>
+              <h1 id="channel-title">{channelLabel}</h1>
+              <p className="subtitle">{subtitle}</p>
+            </div>
+            <div className="head-actions">
+              <button
+                type="button"
+                onClick={toggleSound}
+                className="icon-button"
+                aria-pressed={soundOn}
+                aria-label={soundOn ? "Mute receiver sound" : "Turn on receiver sound"}
+                title={soundOn ? "Sound on" : "Sound off"}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 9.5h3.5L12 6v12l-4.5-3.5H4z" />
+                  {soundOn ? (
+                    <path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11" />
+                  ) : (
+                    <path d="M16 9.5l5 5M21 9.5l-5 5" />
+                  )}
+                </svg>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  vibrate(12);
+                  setHistory(readHistory());
+                  setHistoryOpen(true);
+                }}
+                className="icon-button"
+                aria-label="Open signal log"
+                aria-haspopup="dialog"
+                title="Signal log"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 8v4l2.8 1.6M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4" />
+                </svg>
+              </button>
+            </div>
           </header>
 
-          <article className="signal-card min-h-72 rounded-[1.2rem] border border-[var(--line)] p-4">
-            {loading ? (
-              <div className="animate-pulse space-y-3">
-                <div className="h-3 w-24 rounded bg-[var(--line)]" />
-                <div className="h-9 rounded bg-[var(--line)]" />
-                <div className="h-14 rounded bg-[var(--line)]" />
+          <article
+            className="signal-card"
+            onPointerDown={onCardDown}
+            onPointerMove={onCardMove}
+            onPointerUp={onCardUp}
+            onPointerCancel={onCardUp}
+            onClickCapture={onCardClickCapture}
+            aria-busy={status === "loading"}
+          >
+            {status === "loading" ? (
+              <div className="card-skeleton" aria-label="Loading headlines">
+                <span style={{ width: "40%" }} />
+                <span className="tall" />
+                <span className="tall" style={{ width: "70%" }} />
+                <span />
+                <span style={{ width: "85%" }} />
               </div>
-            ) : current ? (
-              <>
-                <p className="font-mono text-[0.7rem] uppercase tracking-[0.18em] text-[var(--ink-soft)]">
-                  {current.source} / {formatStamp(current.publishedAt)}
+            ) : status === "error" || !current ? (
+              <div className="card-empty">
+                <p className="meta">Signal lost</p>
+                <p className="card-empty-text">
+                  {data?.message ?? "Couldn't reach the newsroom feeds. Check your connection."}
                 </p>
-                <h2 className="mt-2 text-[2rem] leading-[1.02] font-semibold text-[var(--ink)]">
-                  {current.title}
-                </h2>
-                <p className="mt-3 line-clamp-2 text-[1rem] leading-relaxed text-[var(--ink-soft)]">
-                  {current.summary}
-                </p>
-
-                <div className="mt-5 flex items-end justify-between gap-3">
-                  <a
-                    href={current.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    onClick={() => vibrate(22)}
-                    className="read-link"
-                  >
-                    Read Further
-                  </a>
-                  <button onClick={showNext} className="dial-button" type="button">
-                    Next Headline
-                  </button>
-                </div>
-              </>
+                <button type="button" className="pill-button" onClick={retry}>
+                  Scan again
+                </button>
+              </div>
             ) : (
-              <div className="space-y-3">
-                <p className="font-mono text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-                  Signal unavailable
+              <div className="tuned" key={current.id}>
+                <p className="meta">
+                  <span>{current.source}</span>
+                  <span aria-hidden="true">·</span>
+                  <time dateTime={current.publishedAt} title={new Date(current.publishedAt).toLocaleString()}>
+                    {relativeTime(current.publishedAt, now)}
+                  </time>
                 </p>
-                <p className="text-lg leading-relaxed text-[var(--ink)]">
-                  {message || "No stories are available from the feeds right now."}
-                </p>
+                <h2 className="headline">{current.title}</h2>
+                {current.summary && <p className="summary">{current.summary}</p>}
+
+                <div className="coverage">
+                  <span className="coverage-label">
+                    {current.coverage.length > 1
+                      ? `Carried by ${current.coverage.length} newsrooms`
+                      : "Single-source report"}
+                  </span>
+                  {current.coverage.length > 1 && (
+                    <ul>
+                      {current.coverage.map((item) => (
+                        <li key={item.source}>
+                          <a
+                            href={item.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title={item.title}
+                            className="coverage-chip"
+                          >
+                            {item.source}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                <a
+                  href={current.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => vibrate(16)}
+                  className="read-link"
+                >
+                  Read at {current.source}
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M7 17L17 7M9 7h8v8" />
+                  </svg>
+                </a>
+              </div>
+            )}
+            {status !== "error" && (
+              <div className="static-veil" aria-hidden="true">
+                <span>{status === "loading" ? "Scanning" : "Tuning"}</span>
               </div>
             )}
           </article>
 
-          <footer className="flex items-center justify-between border-t border-dashed border-[var(--line)] pt-3 font-mono text-[0.68rem] uppercase tracking-[0.14em] text-[var(--ink-soft)]">
-            <span>Seen: {history.length}</span>
-            <span>Feeds: {feedHealth || "--"}</span>
+          <footer className="ledger-foot">
+            <span>Logged {history.length}</span>
+            <span title={feedsDown.length ? `Off air: ${feedsDown.join(", ")}` : "All feeds on air"}>
+              {data?.feedHealth ?? "--"} on air
+            </span>
+            <span>
+              {data && (
+                <time dateTime={data.generatedAt} title="Last updated">
+                  {new Date(data.generatedAt).toLocaleTimeString([], {
+                    hour: "numeric",
+                    minute: "2-digit",
+                  })}
+                </time>
+              )}
+            </span>
           </footer>
         </section>
 
-        <section className="radio-deck flex w-full flex-col rounded-[1.2rem] border border-[var(--line)] p-3">
-          <div className="dial-window">
-            <div className="dial-minor" />
-            <div className="dial-medium" />
-            <div className="dial-major" />
-            <div className="dial-frequency-labels" aria-hidden="true">
-              <span style={{ left: "6%" }}>88</span>
-              <span style={{ left: "18%" }}>92</span>
-              <span style={{ left: "30%" }}>96</span>
-              <span style={{ left: "42%" }}>100</span>
-              <span style={{ left: "54%" }}>104</span>
-              <span style={{ left: "66%" }}>108</span>
-              <span style={{ left: "79%" }}>112</span>
-              <span style={{ left: "91%" }}>114</span>
-            </div>
-            <div className="dial-needle" style={{ left: `${tune}%` }}>
-              <span className="dial-needle-glass" />
-              <span className="dial-needle-ring" />
-            </div>
-          </div>
-          <div className="radio-control-wrap">
-            <button
-              type="button"
-              className="rotary-knob"
-              aria-label="Tune radio dial"
-              onWheel={(event) => {
-                event.preventDefault();
-                adjustTune(event.deltaY > 0 ? -1.5 : 1.5);
-              }}
-              onPointerDown={onKnobPointerDown}
-              onPointerMove={onKnobPointerMove}
-              onPointerUp={onKnobPointerUp}
-              onPointerCancel={onKnobPointerUp}
-            >
-              <span
-                className="rotary-face"
-                style={{ transform: `rotate(${knobAngle}deg)` }}
-              >
-                <span className="rotary-marker" />
-              </span>
-              <span className="rotary-core" />
-            </button>
-          </div>
-        </section>
+        <Tuner
+          engine={engine}
+          stations={stations}
+          headlines={headlines}
+          seenIds={seenIds}
+          nearest={nearest}
+          locked={locked}
+          scanning={status === "loading"}
+        />
+
+        <p className="hint">
+          Turn the dial · drag the band · swipe the story
+          <span className="kbd-only">
+            {" "}
+            · <kbd>←</kbd> <kbd>→</kbd> to seek
+          </span>
+        </p>
       </div>
 
-      <aside
-        className={`history-drawer ${historyOpen ? "open" : ""}`}
-        aria-hidden={!historyOpen}
-      >
-        <div className="mx-auto w-full max-w-md rounded-t-[1.2rem] border border-b-0 border-[var(--line)] bg-[var(--paper)] p-4 shadow-[0_-12px_35px_rgba(53,40,23,0.16)]">
-          <div className="mb-3 flex items-center justify-between border-b border-dashed border-[var(--line)] pb-2">
-            <h3 className="text-2xl font-semibold">Signal Log</h3>
-            <button
-              type="button"
-              onClick={toggleHistory}
-              className="font-mono text-xs uppercase tracking-[0.16em] text-[var(--ink-soft)]"
-            >
-              Close
-            </button>
-          </div>
+      <p className="sr-only" aria-live="polite">
+        {locked && current ? `Channel ${nearest + 1}, ${current.source}: ${current.title}` : ""}
+      </p>
 
-          {groupedHistory.length === 0 ? (
-            <p className="text-sm text-[var(--ink-soft)]">
-              No headlines viewed yet.
-            </p>
-          ) : (
-            <div className="max-h-[58dvh] space-y-4 overflow-auto pr-1">
-              {groupedHistory.map(([day, items]) => (
-                <section key={day} className="space-y-2">
-                  <p className="font-mono text-[0.66rem] uppercase tracking-[0.18em] text-[var(--ink-soft)]">
-                    {day}
-                  </p>
-                  {items.map((item) => (
-                    <a
-                      key={item.id}
-                      href={item.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="history-item block rounded-md border border-[var(--line)] p-2"
-                    >
-                      <p className="text-base leading-tight text-[var(--ink)]">
-                        {item.title}
-                      </p>
-                      <p className="mt-1 font-mono text-[0.64rem] uppercase tracking-[0.16em] text-[var(--ink-soft)]">
-                        {item.source} / {formatStamp(item.seenAt)}
-                      </p>
-                    </a>
-                  ))}
-                </section>
-              ))}
-            </div>
-          )}
-        </div>
-      </aside>
+      <HistoryDrawer
+        open={historyOpen}
+        history={history}
+        onClose={closeHistory}
+        onClear={() => setHistory(clearHistory())}
+      />
     </main>
   );
 }
